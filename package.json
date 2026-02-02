@@ -1,0 +1,15 @@
+{
+  "name": "ougpt-github-write-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0",
+    "express": "^4.19.2"
+  }
+}
