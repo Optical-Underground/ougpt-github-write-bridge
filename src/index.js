@@ -25,8 +25,13 @@ const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const DIAG_PROBE_ENABLED = String(process.env.DIAG_PROBE_ENABLED || "").toLowerCase() === "true";
+const DIAG_PROBE_ENABLED =
+  String(process.env.DIAG_PROBE_ENABLED || "").toLowerCase() === "true";
 const PROBE_SECRET = process.env.PROBE_SECRET || "";
+
+// Read limits (keep responses sane)
+const MAX_SNAPSHOT_PATHS = 20;
+const MAX_FILE_BYTES = 512 * 1024; // 512 KB per file (decoded)
 
 // ---- Helpers ----
 function requireBridgeSecret(req, res) {
@@ -45,15 +50,25 @@ function isRepoAllowed(fullRepo) {
 
 function parseRepo(fullRepo) {
   if (typeof fullRepo !== "string" || !fullRepo.includes("/")) {
-    throw new Error(`Invalid repo. Expected "owner/name", got: ${String(fullRepo)}`);
+    throw new Error(
+      `Invalid repo. Expected "owner/name", got: ${String(fullRepo)}`
+    );
   }
   const [owner, repo] = fullRepo.split("/");
-  if (!owner || !repo) throw new Error(`Invalid repo. Expected "owner/name", got: ${String(fullRepo)}`);
+  if (!owner || !repo) {
+    throw new Error(
+      `Invalid repo. Expected "owner/name", got: ${String(fullRepo)}`
+    );
+  }
   return { owner, repo };
 }
 
 function toBase64Utf8(str) {
   return Buffer.from(str, "utf8").toString("base64");
+}
+
+function fromBase64ToBuffer(b64) {
+  return Buffer.from(b64, "base64");
 }
 
 async function ensureBranchFromBase({ octokit, owner, repo, base, branch }) {
@@ -89,8 +104,12 @@ async function createTreeWithEdits({ octokit, owner, repo, baseTreeSha, edits })
     const action = edit?.action;
     const content = edit?.content;
 
-    if (!path || typeof path !== "string") throw new Error("Each edit must include a string 'path'.");
-    if (!action || typeof action !== "string") throw new Error("Each edit must include an 'action'.");
+    if (!path || typeof path !== "string") {
+      throw new Error("Each edit must include a string 'path'.");
+    }
+    if (!action || typeof action !== "string") {
+      throw new Error("Each edit must include an 'action'.");
+    }
 
     if (action === "delete") {
       tree.push({ path, mode: "100644", type: "blob", sha: null });
@@ -100,7 +119,9 @@ async function createTreeWithEdits({ octokit, owner, repo, baseTreeSha, edits })
     if (action !== "create" && action !== "update") {
       throw new Error(`Invalid edit action: ${action}. Use create|update|delete.`);
     }
-    if (typeof content !== "string") throw new Error(`Edit ${action} for ${path} requires string 'content'.`);
+    if (typeof content !== "string") {
+      throw new Error(`Edit ${action} for ${path} requires string 'content'.`);
+    }
 
     const blob = await octokit.git.createBlob({
       owner,
@@ -167,6 +188,51 @@ async function openPullRequest({ octokit, owner, repo, base, head, title, body, 
   return pr.data;
 }
 
+async function readFileViaContentsApi({ octokit, owner, repo, path, ref }) {
+  // GitHub returns either a file object or an array for directories
+  const resp = await octokit.repos.getContent({
+    owner,
+    repo,
+    path,
+    ref,
+  });
+
+  if (Array.isArray(resp.data)) {
+    throw new Error(`Path is a directory (expected file): ${path}`);
+  }
+
+  // For files, GitHub returns base64 content (usually) and size
+  const { type, encoding, content, size, name } = resp.data;
+
+  if (type !== "file") {
+    throw new Error(`Path is not a file: ${path} (type=${type || "unknown"})`);
+  }
+  if (encoding !== "base64") {
+    throw new Error(`Unsupported encoding for ${path}: ${encoding}`);
+  }
+  if (typeof size === "number" && size > MAX_FILE_BYTES) {
+    throw new Error(`File too large (${size} bytes) for ${path}; limit is ${MAX_FILE_BYTES} bytes`);
+  }
+  if (typeof content !== "string") {
+    throw new Error(`No content returned for file: ${path}`);
+  }
+
+  // Remove any newlines GitHub includes in base64 content
+  const b64 = content.replace(/\n/g, "");
+  const buf = fromBase64ToBuffer(b64);
+  if (buf.length > MAX_FILE_BYTES) {
+    throw new Error(`File too large after decode (${buf.length} bytes) for ${path}`);
+  }
+
+  return {
+    path,
+    name: name || path.split("/").pop(),
+    encoding: "utf-8",
+    content: buf.toString("utf8"),
+    bytes: buf.length,
+  };
+}
+
 // ---- Routes ----
 
 // Make both "/" and "/health" return 200 so Render health checks always pass.
@@ -181,9 +247,11 @@ app.get("/version", (req, res) => {
     node: process.version,
     allowed_repos_count: ALLOWED_REPOS.length,
     diag_probe_enabled: DIAG_PROBE_ENABLED,
+    read_endpoint: "/snapshot",
   });
 });
 
+// Optional diagnostics probe
 app.get("/diag/probe", (req, res) => {
   if (!DIAG_PROBE_ENABLED) return res.status(404).json({ error: "Not found" });
   const got = req.header("x-probe-secret");
@@ -198,6 +266,63 @@ app.get("/diag/probe", (req, res) => {
   });
 });
 
+// READ: snapshot files (secret-protected)
+app.post("/snapshot", async (req, res) => {
+  if (requireBridgeSecret(req, res)) return;
+
+  const { repo, ref, paths } = req.body || {};
+
+  try {
+    if (!repo) return res.status(400).json({ error: "Missing required field: repo" });
+    if (!isRepoAllowed(repo)) return res.status(403).json({ error: "Repo not allowed" });
+
+    const refToUse = ref || "main";
+    const list = Array.isArray(paths) ? paths : [];
+    if (!list.length) return res.status(400).json({ error: "Missing required field: paths (non-empty array)" });
+    if (list.length > MAX_SNAPSHOT_PATHS) {
+      return res.status(400).json({ error: `Too many paths. Max is ${MAX_SNAPSHOT_PATHS}` });
+    }
+
+    for (const p of list) {
+      if (typeof p !== "string" || !p.trim()) {
+        return res.status(400).json({ error: "All paths must be non-empty strings" });
+      }
+      if (p.includes("..")) {
+        return res.status(400).json({ error: `Invalid path (.. not allowed): ${p}` });
+      }
+    }
+
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = new Octokit({ auth: GITHUB_TOKEN });
+
+    const files = [];
+    for (const p of list) {
+      const file = await readFileViaContentsApi({
+        octokit,
+        owner,
+        repo: repoName,
+        path: p,
+        ref: refToUse,
+      });
+      files.push(file);
+    }
+
+    return res.json({
+      ok: true,
+      repo,
+      ref: refToUse,
+      files,
+    });
+  } catch (err) {
+    const status = err?.status || 500;
+    return res.status(status).json({
+      error: err?.message || "Unknown error",
+      status,
+    });
+  }
+});
+
+// WRITE: create PR endpoint
 app.post("/pr", async (req, res) => {
   if (requireBridgeSecret(req, res)) return;
 
@@ -205,7 +330,9 @@ app.post("/pr", async (req, res) => {
 
   try {
     if (!repo || !base || !branch || !title) {
-      return res.status(400).json({ error: "Missing required fields. Need: repo, base, branch, title" });
+      return res.status(400).json({
+        error: "Missing required fields. Need: repo, base, branch, title",
+      });
     }
     if (!isRepoAllowed(repo)) return res.status(403).json({ error: "Repo not allowed" });
 
@@ -214,7 +341,12 @@ app.post("/pr", async (req, res) => {
 
     await ensureBranchFromBase({ octokit, owner, repo: repoName, base, branch });
 
-    const { headSha, treeSha } = await getHeadCommitAndTree({ octokit, owner, repo: repoName, branch });
+    const { headSha, treeSha } = await getHeadCommitAndTree({
+      octokit,
+      owner,
+      repo: repoName,
+      branch,
+    });
 
     const newTreeSha = await createTreeWithEdits({
       octokit,
@@ -255,7 +387,10 @@ app.post("/pr", async (req, res) => {
     });
   } catch (err) {
     const status = err?.status || 500;
-    return res.status(status).json({ error: err?.message || "Unknown error", status });
+    return res.status(status).json({
+      error: err?.message || "Unknown error",
+      status,
+    });
   }
 });
 
