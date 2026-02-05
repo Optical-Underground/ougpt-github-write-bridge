@@ -242,7 +242,7 @@ app.get("/version", (req, res) => {
     render_git_commit: process.env.RENDER_GIT_COMMIT || null,
     node: process.version,
     allowed_repos_count: ALLOWED_REPOS.length,
-    allowed_repos: ALLOWED_REPOS,   // ← ADD THIS LINE
+    allowed_repos: ALLOWED_REPOS,   // <-- THIS LINE MUST BE PRESENT
     diag_probe_enabled: DIAG_PROBE_ENABLED,
     read_endpoint: "/snapshot",
   });
