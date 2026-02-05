@@ -236,16 +236,13 @@ async function readFileViaContentsApi({ octokit, owner, repo, path, ref }) {
 // ---- Routes ----
 
 // Make both "/" and "/health" return 200 so Render health checks always pass.
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).json({ status: "ok" }));
-
-// Deploy marker so we can prove which code is running.
 app.get("/version", (req, res) => {
   res.status(200).json({
     ok: true,
     render_git_commit: process.env.RENDER_GIT_COMMIT || null,
     node: process.version,
     allowed_repos_count: ALLOWED_REPOS.length,
+    allowed_repos: ALLOWED_REPOS,   // ← ADD THIS LINE
     diag_probe_enabled: DIAG_PROBE_ENABLED,
     read_endpoint: "/snapshot",
   });
