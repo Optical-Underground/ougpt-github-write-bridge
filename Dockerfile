@@ -1,18 +1,17 @@
 FROM node:20-alpine
 
+# Cache bust – change this value when you need to force rebuild
+ARG CACHE_BUST=2026-02-05-read-debug
+ENV CACHE_BUST=${CACHE_BUST}
+
 WORKDIR /app
 
-# Install deps (production only)
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 
-# Copy source
 COPY . .
 
 ENV NODE_ENV=production
-
-# Render will route to $PORT; this is informational only.
 EXPOSE 10000
 
-# Run the server directly so we know exactly what's executing
 CMD ["node", "src/index.js"]
