@@ -32,9 +32,10 @@ const PROBE_SECRET = process.env.PROBE_SECRET || "";
 function requireBridgeSecret(req, res) {
   const got = req.header("x-bridge-secret");
   if (!got || got !== BRIDGE_SECRET) {
-    return res.status(403).json({ error: "Forbidden" });
+    res.status(403).json({ error: "Forbidden" });
+    return true;
   }
-  return null;
+  return false;
 }
 
 function isRepoAllowed(fullRepo) {
@@ -56,52 +57,31 @@ function toBase64Utf8(str) {
 }
 
 async function ensureBranchFromBase({ octokit, owner, repo, base, branch }) {
-  // Get base branch ref -> sha
-  const baseRef = await octokit.git.getRef({
-    owner,
-    repo,
-    ref: `heads/${base}`,
-  });
+  const baseRef = await octokit.git.getRef({ owner, repo, ref: `heads/${base}` });
   const baseSha = baseRef.data.object.sha;
 
-  // If branch exists, do nothing; else create it at base sha
   try {
     await octokit.git.getRef({ owner, repo, ref: `heads/${branch}` });
-    return { baseSha, branchSha: null, created: false };
+    return { baseSha, created: false };
   } catch (e) {
     if (e?.status !== 404) throw e;
   }
 
-  await octokit.git.createRef({
-    owner,
-    repo,
-    ref: `refs/heads/${branch}`,
-    sha: baseSha,
-  });
-
-  return { baseSha, branchSha: baseSha, created: true };
+  await octokit.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: baseSha });
+  return { baseSha, created: true };
 }
 
 async function getHeadCommitAndTree({ octokit, owner, repo, branch }) {
-  const ref = await octokit.git.getRef({
-    owner,
-    repo,
-    ref: `heads/${branch}`,
-  });
+  const ref = await octokit.git.getRef({ owner, repo, ref: `heads/${branch}` });
   const headSha = ref.data.object.sha;
 
-  const commit = await octokit.git.getCommit({
-    owner,
-    repo,
-    commit_sha: headSha,
-  });
-
+  const commit = await octokit.git.getCommit({ owner, repo, commit_sha: headSha });
   const treeSha = commit.data.tree.sha;
+
   return { headSha, treeSha };
 }
 
 async function createTreeWithEdits({ octokit, owner, repo, baseTreeSha, edits }) {
-  // Build tree entries
   const tree = [];
 
   for (const edit of edits || []) {
@@ -109,12 +89,8 @@ async function createTreeWithEdits({ octokit, owner, repo, baseTreeSha, edits })
     const action = edit?.action;
     const content = edit?.content;
 
-    if (!path || typeof path !== "string") {
-      throw new Error("Each edit must include a string 'path'.");
-    }
-    if (!action || typeof action !== "string") {
-      throw new Error("Each edit must include an 'action' (create|update|delete).");
-    }
+    if (!path || typeof path !== "string") throw new Error("Each edit must include a string 'path'.");
+    if (!action || typeof action !== "string") throw new Error("Each edit must include an 'action'.");
 
     if (action === "delete") {
       tree.push({ path, mode: "100644", type: "blob", sha: null });
@@ -124,10 +100,7 @@ async function createTreeWithEdits({ octokit, owner, repo, baseTreeSha, edits })
     if (action !== "create" && action !== "update") {
       throw new Error(`Invalid edit action: ${action}. Use create|update|delete.`);
     }
-
-    if (typeof content !== "string") {
-      throw new Error(`Edit ${action} for ${path} requires string 'content'.`);
-    }
+    if (typeof content !== "string") throw new Error(`Edit ${action} for ${path} requires string 'content'.`);
 
     const blob = await octokit.git.createBlob({
       owner,
@@ -136,12 +109,7 @@ async function createTreeWithEdits({ octokit, owner, repo, baseTreeSha, edits })
       encoding: "base64",
     });
 
-    tree.push({
-      path,
-      mode: "100644",
-      type: "blob",
-      sha: blob.data.sha,
-    });
+    tree.push({ path, mode: "100644", type: "blob", sha: blob.data.sha });
   }
 
   const newTree = await octokit.git.createTree({
@@ -175,7 +143,6 @@ async function commitAndMoveBranch({ octokit, owner, repo, branch, parentSha, tr
 }
 
 async function openPullRequest({ octokit, owner, repo, base, head, title, body, draft }) {
-  // If an open PR already exists for head->base, reuse it (idempotent-ish)
   const prs = await octokit.pulls.list({
     owner,
     repo,
@@ -202,12 +169,21 @@ async function openPullRequest({ octokit, owner, repo, base, head, title, body, 
 
 // ---- Routes ----
 
-// Public health endpoint (no secret) so we can tell "up" vs "auth blocked"
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok" });
+// Make both "/" and "/health" return 200 so Render health checks always pass.
+app.get("/", (req, res) => res.status(200).send("ok"));
+app.get("/health", (req, res) => res.status(200).json({ status: "ok" }));
+
+// Deploy marker so we can prove which code is running.
+app.get("/version", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    render_git_commit: process.env.RENDER_GIT_COMMIT || null,
+    node: process.version,
+    allowed_repos_count: ALLOWED_REPOS.length,
+    diag_probe_enabled: DIAG_PROBE_ENABLED,
+  });
 });
 
-// Optional diagnostics probe
 app.get("/diag/probe", (req, res) => {
   if (!DIAG_PROBE_ENABLED) return res.status(404).json({ error: "Not found" });
   const got = req.header("x-probe-secret");
@@ -222,40 +198,22 @@ app.get("/diag/probe", (req, res) => {
   });
 });
 
-// Create PR endpoint
 app.post("/pr", async (req, res) => {
-  const authErr = requireBridgeSecret(req, res);
-  if (authErr) return authErr;
+  if (requireBridgeSecret(req, res)) return;
 
-  const {
-    repo,       // "Owner/name"
-    base,       // base branch, e.g. "main"
-    branch,     // head branch, e.g. "ougpt/test-1"
-    title,
-    body: pr_body,
-    draft,
-    edits,
-  } = req.body || {};
+  const { repo, base, branch, title, body: pr_body, draft, edits } = req.body || {};
 
   try {
     if (!repo || !base || !branch || !title) {
-      return res.status(400).json({
-        error: "Missing required fields. Need: repo, base, branch, title",
-      });
+      return res.status(400).json({ error: "Missing required fields. Need: repo, base, branch, title" });
     }
-
-    if (!isRepoAllowed(repo)) {
-      return res.status(403).json({ error: "Repo not allowed" });
-    }
+    if (!isRepoAllowed(repo)) return res.status(403).json({ error: "Repo not allowed" });
 
     const { owner, repo: repoName } = parseRepo(repo);
-
     const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-    // Ensure branch exists at base
     await ensureBranchFromBase({ octokit, owner, repo: repoName, base, branch });
 
-    // Apply edits by committing to branch
     const { headSha, treeSha } = await getHeadCommitAndTree({ octokit, owner, repo: repoName, branch });
 
     const newTreeSha = await createTreeWithEdits({
@@ -266,9 +224,6 @@ app.post("/pr", async (req, res) => {
       edits: Array.isArray(edits) ? edits : [],
     });
 
-    // Commit message: keep it deterministic-ish
-    const commitMessage = `ougpt: apply edits for PR "${title}"`;
-
     const commitSha = await commitAndMoveBranch({
       octokit,
       owner,
@@ -276,10 +231,9 @@ app.post("/pr", async (req, res) => {
       branch,
       parentSha: headSha,
       treeSha: newTreeSha,
-      message: commitMessage,
+      message: `ougpt: apply edits for PR "${title}"`,
     });
 
-    // Open PR
     const pr = await openPullRequest({
       octokit,
       owner,
@@ -301,10 +255,7 @@ app.post("/pr", async (req, res) => {
     });
   } catch (err) {
     const status = err?.status || 500;
-    return res.status(status).json({
-      error: err?.message || "Unknown error",
-      status,
-    });
+    return res.status(status).json({ error: err?.message || "Unknown error", status });
   }
 });
 
