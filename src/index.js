@@ -4,6 +4,23 @@ import { Octokit } from "@octokit/rest";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+import http from "http";
+
+const EARLY_PORT = process.env.PORT || 10000;
+
+// ultra-early health responder (before Express boot)
+http
+  .createServer((req, res) => {
+    if (req.url === "/" || req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  })
+  .listen(EARLY_PORT, "0.0.0.0");
+
 
 // ---- Config ----
 const PORT = process.env.PORT || 10000;
