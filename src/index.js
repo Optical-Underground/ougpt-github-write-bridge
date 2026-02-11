@@ -1,42 +1,45 @@
 import express from "express";
+import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// ---- Config ----
+// --------------------
+// Config
+// --------------------
 const PORT = process.env.PORT || 10000;
 
-// ---- Always-on health (Render-safe) ----
-app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/health", (_req, res) => res.status(200).json({ status: "ok" }));
-
-// ---- Start server FIRST (critical for Render) ----
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`GitHub Write Bridge listening on ${PORT}`);
-});
-
-// ---- Validate env vars AFTER listen ----
-const BRIDGE_SECRET = process.env.BRIDGE_SECRET;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-
-if (!BRIDGE_SECRET) {
-  console.error("CONFIG ERROR: BRIDGE_SECRET is missing");
-}
-if (!GITHUB_TOKEN) {
-  console.error("CONFIG ERROR: GITHUB_TOKEN is missing");
-}
-
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET || "";
 const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-const DIAG_PROBE_ENABLED =
-  String(process.env.DIAG_PROBE_ENABLED || "").toLowerCase() === "true";
-const PROBE_SECRET = process.env.PROBE_SECRET || "";
+const AUTH_MODE = process.env.GITHUB_AUTH_MODE || "pat";
 
-// ---- Helpers ----
+// App auth
+const APP_ID = process.env.GITHUB_APP_ID;
+const INSTALLATION_ID = process.env.GITHUB_APP_INSTALLATION_ID;
+const PRIVATE_KEY = process.env.GITHUB_APP_PRIVATE_KEY;
+
+// PAT auth (legacy / fallback)
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+
+// --------------------
+// Health (Render-safe)
+// --------------------
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.status(200).json({ status: "ok" }));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`GitHub Write Bridge listening on ${PORT}`);
+});
+
+// --------------------
+// Helpers
+// --------------------
 function requireBridgeSecret(req, res) {
   if (req.header("x-bridge-secret") !== BRIDGE_SECRET) {
     res.status(403).json({ error: "Forbidden" });
@@ -56,7 +59,53 @@ function parseRepo(fullRepo) {
   return { owner, repo };
 }
 
-// ---- Version ----
+// --------------------
+// GitHub Auth
+// --------------------
+function createAppJwt() {
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    {
+      iat: now - 60,
+      exp: now + 9 * 60,
+      iss: APP_ID,
+    },
+    PRIVATE_KEY,
+    { algorithm: "RS256" }
+  );
+}
+
+async function getOctokit() {
+  if (AUTH_MODE === "app") {
+    if (!APP_ID || !INSTALLATION_ID || !PRIVATE_KEY) {
+      throw new Error("Missing GitHub App configuration");
+    }
+
+    const appJwt = createAppJwt();
+    const appOctokit = new Octokit({
+      auth: appJwt,
+    });
+
+    const tokenResp = await appOctokit.request(
+      "POST /app/installations/{installation_id}/access_tokens",
+      { installation_id: INSTALLATION_ID }
+    );
+
+    return new Octokit({
+      auth: tokenResp.data.token,
+    });
+  }
+
+  if (!GITHUB_TOKEN) {
+    throw new Error("Missing GITHUB_TOKEN");
+  }
+
+  return new Octokit({ auth: GITHUB_TOKEN });
+}
+
+// --------------------
+// Version
+// --------------------
 app.get("/version", (_req, res) => {
   res.json({
     ok: true,
@@ -64,12 +113,14 @@ app.get("/version", (_req, res) => {
     node: process.version,
     allowed_repos_count: ALLOWED_REPOS.length,
     allowed_repos: ALLOWED_REPOS,
-    diag_probe_enabled: DIAG_PROBE_ENABLED,
+    auth_mode: AUTH_MODE,
     read_endpoint: "/snapshot",
   });
 });
 
-// ---- Snapshot (read) ----
+// --------------------
+// Snapshot (read)
+// --------------------
 app.post("/snapshot", async (req, res) => {
   if (requireBridgeSecret(req, res)) return;
 
@@ -83,11 +134,16 @@ app.post("/snapshot", async (req, res) => {
 
   try {
     const { owner, repo: repoName } = parseRepo(repo);
-    const octokit = new Octokit({ auth: GITHUB_TOKEN });
+    const octokit = await getOctokit();
 
     const files = [];
     for (const path of paths) {
-      const r = await octokit.repos.getContent({ owner, repo: repoName, path, ref });
+      const r = await octokit.repos.getContent({
+        owner,
+        repo: repoName,
+        path,
+        ref,
+      });
       if (Array.isArray(r.data)) {
         throw new Error(`Path is a directory: ${path}`);
       }
@@ -100,6 +156,105 @@ app.post("/snapshot", async (req, res) => {
     }
 
     res.json({ ok: true, repo, ref, files });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --------------------
+// PR (write)
+// --------------------
+app.post("/pr", async (req, res) => {
+  if (requireBridgeSecret(req, res)) return;
+
+  const {
+    repo,
+    base = "main",
+    branch,
+    title,
+    body,
+    edits = [],
+    draft = false,
+  } = req.body || {};
+
+  if (!repo || !branch || !title || !Array.isArray(edits)) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (!isRepoAllowed(repo)) {
+    return res.status(403).json({ error: "Repo not allowed" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokit();
+
+    const baseRef = await octokit.git.getRef({
+      owner,
+      repo: repoName,
+      ref: `heads/${base}`,
+    });
+
+    const baseSha = baseRef.data.object.sha;
+
+    const newTreeItems = [];
+    for (const e of edits) {
+      if (e.action === "delete") {
+        newTreeItems.push({ path: e.path, sha: null });
+      } else {
+        const blob = await octokit.git.createBlob({
+          owner,
+          repo: repoName,
+          content: e.content,
+          encoding: "utf-8",
+        });
+        newTreeItems.push({
+          path: e.path,
+          mode: "100644",
+          type: "blob",
+          sha: blob.data.sha,
+        });
+      }
+    }
+
+    const newTree = await octokit.git.createTree({
+      owner,
+      repo: repoName,
+      base_tree: baseSha,
+      tree: newTreeItems,
+    });
+
+    const commit = await octokit.git.createCommit({
+      owner,
+      repo: repoName,
+      message: title,
+      tree: newTree.data.sha,
+      parents: [baseSha],
+    });
+
+    await octokit.git.createRef({
+      owner,
+      repo: repoName,
+      ref: `refs/heads/${branch}`,
+      sha: commit.data.sha,
+    });
+
+    const pr = await octokit.pulls.create({
+      owner,
+      repo: repoName,
+      base,
+      head: branch,
+      title,
+      body: body || "",
+      draft: Boolean(draft),
+    });
+
+    res.json({
+      ok: true,
+      pr_url: pr.data.html_url,
+      pr_number: pr.data.number,
+      branch,
+      commit_sha: commit.data.sha,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
