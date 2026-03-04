@@ -1,3 +1,4 @@
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=pr-head-normalize-v1");
 import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";

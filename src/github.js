@@ -71,6 +71,7 @@ export async function applyEdits({ octokit, owner, repo, branch, edits }) {
     });
   }
 }
+console.log("openPullRequest head(raw)=", head, "head(normalized)=", normalizedHead, "owner=", owner, "repo=", repo, "base=", base);
 
 export async function openPullRequest({ octokit, owner, repo, base, head, title, body, draft }) {
   const r = await octokit.pulls.create({
