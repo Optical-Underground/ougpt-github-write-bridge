@@ -321,7 +321,7 @@ app.post("/pr", async (req, res) => {
       owner,
       repo: repoName,
       base,
-      head: `${owner}:${branch}`,
+      head: branch,
       title,
       body,
       draft,
