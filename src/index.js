@@ -3,7 +3,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
 
-console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-installation-lookup-v1");
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-pr-retry-v1");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -156,6 +156,58 @@ async function getOctokitForRepo(owner, repoName) {
   return new Octokit({ auth: GITHUB_TOKEN });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createPullRequestWithRetry({
+  octokit,
+  owner,
+  repoName,
+  base,
+  head,
+  title,
+  body,
+  draft,
+}) {
+  const maxAttempts = 6;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      console.log(`PR_CREATE_ATTEMPT attempt=${attempt} owner=${owner} repo=${repoName} base=${base} head=${head}`);
+
+      const pr = await octokit.pulls.create({
+        owner,
+        repo: repoName,
+        base,
+        head,
+        title,
+        body,
+        draft,
+      });
+
+      return pr;
+    } catch (err) {
+      const ghErrors = Array.isArray(err?.response?.data?.errors) ? err.response.data.errors : [];
+      const headInvalid = ghErrors.some(
+        (e) => e?.resource === "PullRequest" && e?.field === "head" && e?.code === "invalid"
+      );
+
+      console.log(
+        `PR_CREATE_ERROR attempt=${attempt} status=${err?.status || ""} message=${err?.message || String(err)} headInvalid=${headInvalid}`
+      );
+
+      if (!headInvalid || attempt === maxAttempts) {
+        throw err;
+      }
+
+      await sleep(800 * attempt);
+    }
+  }
+
+  throw new Error("PR creation retry loop exited unexpectedly");
+}
+
 // --------------------
 // Health / Capabilities / Version
 // --------------------
@@ -190,7 +242,7 @@ app.get("/version", (_req, res) => {
     node: process.version,
     allowed_repos: ALLOWED_REPOS,
     auth_mode: AUTH_MODE,
-    commit_mark: "bridge-installation-lookup-v1",
+    commit_mark: "bridge-pr-retry-v1",
   });
 });
 
@@ -261,9 +313,6 @@ app.post("/snapshot", async (req, res) => {
 
 // --------------------
 // PR create -> /pr
-// Accepts BOTH payload styles:
-//  - legacy: { repo, base, branch, title, body, edits[], draft }
-//  - orchestrator: { repo, base_ref, branch_name, title, body, edits[], idempotency_key }
 // --------------------
 app.post("/pr", async (req, res) => {
   if (requireBridgeSecret(req, res)) return;
@@ -292,7 +341,6 @@ app.post("/pr", async (req, res) => {
     const { owner, repo: repoName } = parseRepo(repo);
     const octokit = await getOctokitForRepo(owner, repoName);
 
-    // base ref -> commit sha
     const baseRef = await octokit.git.getRef({
       owner,
       repo: repoName,
@@ -300,7 +348,6 @@ app.post("/pr", async (req, res) => {
     });
     const baseCommitSha = baseRef.data.object.sha;
 
-    // commit sha -> tree sha
     const baseCommit = await octokit.git.getCommit({
       owner,
       repo: repoName,
@@ -354,7 +401,6 @@ app.post("/pr", async (req, res) => {
       parents: [baseCommitSha],
     });
 
-    // create or update branch ref
     try {
       await octokit.git.createRef({
         owner,
@@ -362,6 +408,7 @@ app.post("/pr", async (req, res) => {
         ref: `refs/heads/${branch}`,
         sha: commit.data.sha,
       });
+      console.log(`REF_CREATE_OK repo=${owner}/${repoName} branch=${branch} sha=${commit.data.sha}`);
     } catch (createErr) {
       try {
         await octokit.git.updateRef({
@@ -371,6 +418,7 @@ app.post("/pr", async (req, res) => {
           sha: commit.data.sha,
           force: true,
         });
+        console.log(`REF_UPDATE_OK repo=${owner}/${repoName} branch=${branch} sha=${commit.data.sha}`);
       } catch (updateErr) {
         throw new Error(
           `Failed to create or update branch ${branch}. createRef: ${createErr?.message || String(createErr)} | updateRef: ${updateErr?.message || String(updateErr)}`
@@ -378,22 +426,23 @@ app.post("/pr", async (req, res) => {
       }
     }
 
-    // verify ref exists before PR creation
     try {
       await octokit.git.getRef({
         owner,
         repo: repoName,
         ref: `heads/${branch}`,
       });
+      console.log(`REF_VERIFY_OK repo=${owner}/${repoName} branch=${branch}`);
     } catch (verifyErr) {
       throw new Error(
         `Branch ref heads/${branch} was not visible after create/update: ${verifyErr?.message || String(verifyErr)}`
       );
     }
 
-    const pr = await octokit.pulls.create({
+    const pr = await createPullRequestWithRetry({
+      octokit,
       owner,
-      repo: repoName,
+      repoName,
       base,
       head: branch,
       title,
