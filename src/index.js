@@ -3,7 +3,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
 
-console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-pr-retry-v1");
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-read-file-v1");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -21,15 +21,16 @@ const ALLOWED_REPOS = (process.env.ALLOWED_REPOS || "")
 
 const AUTH_MODE = (process.env.GITHUB_AUTH_MODE || "pat").toLowerCase();
 
-// GitHub App (OUGPT Agent)
+// GitHub App (optional)
 const APP_ID = process.env.GITHUB_APP_ID;
 const PRIVATE_KEY_RAW = process.env.GITHUB_APP_PRIVATE_KEY;
-
-// Optional fallback if you still want it available
 const INSTALLATION_ID = process.env.GITHUB_APP_INSTALLATION_ID;
 
 // PAT fallback
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+
+// Read safety
+const MAX_READ_FILE_BYTES = Number(process.env.MAX_READ_FILE_BYTES || 1024 * 1024);
 
 // --------------------
 // Helpers
@@ -46,11 +47,13 @@ function requireBridgeSecret(req, res) {
     res.status(500).json({ error: "Missing env: BRIDGE_SECRET" });
     return true;
   }
+
   const provided = req.header("x-bridge-secret") || "";
   if (!timingSafeEqualStr(provided, BRIDGE_SECRET)) {
     res.status(403).json({ error: "Forbidden" });
     return true;
   }
+
   return false;
 }
 
@@ -97,6 +100,7 @@ function createAppJwt() {
   if (!APP_ID) throw new Error("Missing GitHub App ID");
 
   const now = Math.floor(Date.now() / 1000);
+
   return jwt.sign(
     {
       iat: now - 60,
@@ -174,7 +178,9 @@ async function createPullRequestWithRetry({
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      console.log(`PR_CREATE_ATTEMPT attempt=${attempt} owner=${owner} repo=${repoName} base=${base} head=${head}`);
+      console.log(
+        `PR_CREATE_ATTEMPT attempt=${attempt} owner=${owner} repo=${repoName} base=${base} head=${head}`
+      );
 
       const pr = await octokit.pulls.create({
         owner,
@@ -188,7 +194,10 @@ async function createPullRequestWithRetry({
 
       return pr;
     } catch (err) {
-      const ghErrors = Array.isArray(err?.response?.data?.errors) ? err.response.data.errors : [];
+      const ghErrors = Array.isArray(err?.response?.data?.errors)
+        ? err.response.data.errors
+        : [];
+
       const headInvalid = ghErrors.some(
         (e) => e?.resource === "PullRequest" && e?.field === "head" && e?.code === "invalid"
       );
@@ -208,51 +217,52 @@ async function createPullRequestWithRetry({
   throw new Error("PR creation retry loop exited unexpectedly");
 }
 
-// --------------------
-// Health / Capabilities / Version
-// --------------------
-app.get("/", (_req, res) => res.status(200).send("ok"));
+async function getTextFileFromRepo({ octokit, owner, repoName, path, ref }) {
+  if (!path || typeof path !== "string") {
+    throw new Error("path required");
+  }
 
-app.get("/health", (_req, res) =>
-  res.status(200).json({
-    ok: true,
-    status: "ok",
-    render_git_commit: process.env.RENDER_GIT_COMMIT || null,
-  })
-);
-
-app.get("/capabilities", async (req, res) => {
-  if (requireBridgeSecret(req, res)) return;
-
-  res.json({
-    ok: true,
-    services: {
-      repos_snapshot: true,
-      prs_create: true,
-    },
-    auth_mode: AUTH_MODE,
-    allowed_repos: ALLOWED_REPOS,
+  const resp = await octokit.repos.getContent({
+    owner,
+    repo: repoName,
+    path,
+    ref,
   });
-});
 
-app.get("/version", (_req, res) => {
-  res.json({
-    ok: true,
-    render_git_commit: process.env.RENDER_GIT_COMMIT || null,
-    node: process.version,
-    allowed_repos: ALLOWED_REPOS,
-    auth_mode: AUTH_MODE,
-    commit_mark: "bridge-pr-retry-v1",
-  });
-});
+  if (Array.isArray(resp.data)) {
+    throw new Error(`Path is a directory: ${path}`);
+  }
 
-// --------------------
-// Repos Snapshot -> /repos/snapshot
-// --------------------
-app.post("/repos/snapshot", async (req, res) => {
+  const file = resp.data;
+
+  if (file.type !== "file") {
+    throw new Error(`Path is not a file: ${path}`);
+  }
+
+  const size = Number(file.size || 0);
+  if (size > MAX_READ_FILE_BYTES) {
+    throw new Error(
+      `File too large to return as text: ${path} (${size} bytes > ${MAX_READ_FILE_BYTES} bytes)`
+    );
+  }
+
+  const base64 = String(file.content || "").replace(/\n/g, "");
+  const buf = Buffer.from(base64, "base64");
+
+  return {
+    path,
+    sha: file.sha,
+    size,
+    encoding: "utf-8",
+    content: buf.toString("utf8"),
+  };
+}
+
+async function handleReposSnapshot(req, res) {
   if (requireBridgeSecret(req, res)) return;
 
   const { repo, ref = "main", paths = [], depth = 3 } = req.body || {};
+
   if (!repo || !ref) {
     return res.status(400).json({ error: "repo and ref required" });
   }
@@ -268,7 +278,10 @@ app.post("/repos/snapshot", async (req, res) => {
     const commitResp = await octokit.repos.getCommit({ owner, repo: repoName, ref });
     const commitSha = commitResp.data.sha;
     const treeSha = commitResp.data.commit?.tree?.sha;
-    if (!treeSha) throw new Error("Could not resolve tree sha");
+
+    if (!treeSha) {
+      throw new Error("Could not resolve tree sha");
+    }
 
     const treeResp = await octokit.git.getTree({
       owner,
@@ -291,25 +304,116 @@ app.post("/repos/snapshot", async (req, res) => {
     const files = [];
     if (Array.isArray(paths) && paths.length) {
       for (const p of paths) {
-        const r = await octokit.repos.getContent({ owner, repo: repoName, path: p, ref });
-        if (Array.isArray(r.data)) throw new Error(`Path is a directory: ${p}`);
-
-        const buf = Buffer.from(String(r.data.content || "").replace(/\n/g, ""), "base64");
-        files.push({ path: p, encoding: "utf-8", content: buf.toString("utf8") });
+        files.push(
+          await getTextFileFromRepo({
+            octokit,
+            owner,
+            repoName,
+            path: p,
+            ref,
+          })
+        );
       }
     }
 
-    res.json({ repo, ref, commit: commitSha, tree, files });
+    res.json({
+      ok: true,
+      repo,
+      ref,
+      commit: commitSha,
+      tree,
+      files,
+    });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
+}
+
+async function handleReadFile(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  const { repo, ref = "main", path } = req.body || {};
+
+  if (!repo || !path) {
+    return res.status(400).json({ error: "repo and path required" });
+  }
+
+  if (!isRepoAllowed(repo)) {
+    return res.status(403).json({ error: "Repo not allowed" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+
+    const file = await getTextFileFromRepo({
+      octokit,
+      owner,
+      repoName,
+      path,
+      ref,
+    });
+
+    res.json({
+      ok: true,
+      repo,
+      ref,
+      ...file,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+}
+
+// --------------------
+// Health / Capabilities / Version
+// --------------------
+app.get("/", (_req, res) => res.status(200).send("ok"));
+
+app.get("/health", (_req, res) =>
+  res.status(200).json({
+    ok: true,
+    status: "ok",
+    render_git_commit: process.env.RENDER_GIT_COMMIT || null,
+  })
+);
+
+app.get("/capabilities", async (req, res) => {
+  if (requireBridgeSecret(req, res)) return;
+
+  res.json({
+    ok: true,
+    services: {
+      repos_snapshot: true,
+      read_file: true,
+      prs_create: true,
+    },
+    auth_mode: AUTH_MODE,
+    allowed_repos: ALLOWED_REPOS,
+    max_read_file_bytes: MAX_READ_FILE_BYTES,
+  });
 });
 
-// Backward compat alias
-app.post("/snapshot", async (req, res) => {
-  req.body = { ...(req.body || {}), depth: (req.body || {}).depth ?? 3 };
-  return app._router.handle(req, res, () => {});
+app.get("/version", (_req, res) => {
+  res.json({
+    ok: true,
+    render_git_commit: process.env.RENDER_GIT_COMMIT || null,
+    node: process.version,
+    allowed_repos: ALLOWED_REPOS,
+    auth_mode: AUTH_MODE,
+    max_read_file_bytes: MAX_READ_FILE_BYTES,
+    commit_mark: "bridge-read-file-v1",
+  });
 });
+
+// --------------------
+// Read / Snapshot
+// --------------------
+app.post("/repos/snapshot", handleReposSnapshot);
+app.post("/snapshot", handleReposSnapshot);
+
+app.post("/repos/read-file", handleReadFile);
+app.post("/read-file", handleReadFile);
 
 // --------------------
 // PR create -> /pr
@@ -467,5 +571,5 @@ app.post("/pr", async (req, res) => {
 // Start
 // --------------------
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`GitHub Write Bridge listening on ${PORT}`);
+  console.log(`GitHub Read/Write Bridge listening on ${PORT}`);
 });
