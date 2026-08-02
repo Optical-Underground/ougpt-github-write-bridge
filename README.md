@@ -18,6 +18,10 @@ Tiny HTTP service that creates/updates branches and opens GitHub PRs from a sign
 
 \- `ALLOWED\_REPOS` = comma-separated allowlist, e.g. `Optical-Underground/pos-for-optical,Optical-Underground/onhand-sold-by-vendor`
 
+\- `OU\_STATE\_REPO` = authoritative state repo for `/state/boot` (defaults to `Optical-Underground/OU-State`)
+
+\- `OU\_STATE\_REF` = authoritative state ref for `/state/boot` (defaults to `main`)
+
 
 
 \## Diagnostics (optional)
@@ -27,6 +31,26 @@ Tiny HTTP service that creates/updates branches and opens GitHub PRs from a sign
 \- `PROBE\_SECRET=...`
 
 Then call `GET /diag/probe` with header `x-probe-secret`.
+
+
+
+\## State boot
+
+`POST /state/boot` with header `x-bridge-secret: <secret>`
+
+Optional payload:
+
+```json
+
+{
+
+&nbsp; "front": "pos-for-optical"
+
+}
+
+```
+
+The endpoint is read-only. It reads OU-State, records the exact source commit, preserves the configured active-front list, reports missing mappings or unreadable front files explicitly, summarizes current-work and coordination files, and reports newest relevant recaps without mutating GitHub or deployment state.
 
 
 
