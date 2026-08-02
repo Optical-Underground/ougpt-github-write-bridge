@@ -2,8 +2,9 @@ import crypto from "crypto";
 import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
+import { buildStateBootPacket } from "./stateBoot.js";
 
-console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-read-file-v1");
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-state-boot-v1");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -31,6 +32,10 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 // Read safety
 const MAX_READ_FILE_BYTES = Number(process.env.MAX_READ_FILE_BYTES || 1024 * 1024);
+
+// OU-State boot safety
+const OU_STATE_REPO = process.env.OU_STATE_REPO || "Optical-Underground/OU-State";
+const OU_STATE_REF = process.env.OU_STATE_REF || "main";
 
 // --------------------
 // Helpers
@@ -164,6 +169,36 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function getRepoCommitAndTree({ octokit, owner, repoName, ref }) {
+  const commitResp = await octokit.repos.getCommit({ owner, repo: repoName, ref });
+  const commitSha = commitResp.data.sha;
+  const treeSha = commitResp.data.commit?.tree?.sha;
+
+  if (!treeSha) {
+    throw new Error("Could not resolve tree sha");
+  }
+
+  const treeResp = await octokit.git.getTree({
+    owner,
+    repo: repoName,
+    tree_sha: treeSha,
+    recursive: "true",
+  });
+
+  const tree = (treeResp.data.tree || [])
+    .filter((n) => n?.path && (n.type === "tree" || n.type === "blob"))
+    .map((n) => ({
+      path: n.path,
+      type: n.type === "tree" ? "dir" : "file",
+      size: n.size ?? 0,
+    }));
+
+  return {
+    commit: commitSha,
+    tree,
+  };
+}
+
 async function createPullRequestWithRetry({
   octokit,
   owner,
@@ -274,32 +309,10 @@ async function handleReposSnapshot(req, res) {
   try {
     const { owner, repo: repoName } = parseRepo(repo);
     const octokit = await getOctokitForRepo(owner, repoName);
-
-    const commitResp = await octokit.repos.getCommit({ owner, repo: repoName, ref });
-    const commitSha = commitResp.data.sha;
-    const treeSha = commitResp.data.commit?.tree?.sha;
-
-    if (!treeSha) {
-      throw new Error("Could not resolve tree sha");
-    }
-
-    const treeResp = await octokit.git.getTree({
-      owner,
-      repo: repoName,
-      tree_sha: treeSha,
-      recursive: "true",
-    });
+    const snapshot = await getRepoCommitAndTree({ octokit, owner, repoName, ref });
 
     const maxDepth = Number.isFinite(Number(depth)) ? Number(depth) : 3;
-
-    const tree = (treeResp.data.tree || [])
-      .filter((n) => n?.path && (n.type === "tree" || n.type === "blob"))
-      .filter((n) => String(n.path).split("/").length <= maxDepth)
-      .map((n) => ({
-        path: n.path,
-        type: n.type === "tree" ? "dir" : "file",
-        size: n.size ?? 0,
-      }));
+    const tree = snapshot.tree.filter((n) => String(n.path).split("/").length <= maxDepth);
 
     const files = [];
     if (Array.isArray(paths) && paths.length) {
@@ -320,7 +333,7 @@ async function handleReposSnapshot(req, res) {
       ok: true,
       repo,
       ref,
-      commit: commitSha,
+      commit: snapshot.commit,
       tree,
       files,
     });
@@ -365,6 +378,45 @@ async function handleReadFile(req, res) {
   }
 }
 
+async function handleStateBoot(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  const { front, project, ref = OU_STATE_REF } = req.body || {};
+  const repo = OU_STATE_REPO;
+  const requestedFront = front || project || null;
+
+  if (!isRepoAllowed(repo)) {
+    return res.status(403).json({ error: "OU-State repo not allowed" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+
+    const packet = await buildStateBootPacket({
+      octokit,
+      owner,
+      repoName,
+      repo,
+      ref,
+      requestedFront,
+      getRepoCommitAndTree,
+      readTextFile: (path, fileRef) =>
+        getTextFileFromRepo({
+          octokit,
+          owner,
+          repoName,
+          path,
+          ref: fileRef || ref,
+        }),
+    });
+
+    res.json(packet);
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+}
+
 // --------------------
 // Health / Capabilities / Version
 // --------------------
@@ -387,10 +439,13 @@ app.get("/capabilities", async (req, res) => {
       repos_snapshot: true,
       read_file: true,
       prs_create: true,
+      state_boot: true,
     },
     auth_mode: AUTH_MODE,
     allowed_repos: ALLOWED_REPOS,
     max_read_file_bytes: MAX_READ_FILE_BYTES,
+    ou_state_repo: OU_STATE_REPO,
+    ou_state_ref: OU_STATE_REF,
   });
 });
 
@@ -402,9 +457,16 @@ app.get("/version", (_req, res) => {
     allowed_repos: ALLOWED_REPOS,
     auth_mode: AUTH_MODE,
     max_read_file_bytes: MAX_READ_FILE_BYTES,
-    commit_mark: "bridge-read-file-v1",
+    ou_state_repo: OU_STATE_REPO,
+    ou_state_ref: OU_STATE_REF,
+    commit_mark: "bridge-state-boot-v1",
   });
 });
+
+// --------------------
+// State
+// --------------------
+app.post("/state/boot", handleStateBoot);
 
 // --------------------
 // Read / Snapshot
