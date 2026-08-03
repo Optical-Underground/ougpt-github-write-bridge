@@ -3,8 +3,9 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
 import { buildStateBootPacket } from "./stateBoot.js";
+import { getProposedOuState, validateStateChange } from "./stateValidation.js";
 
-console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-state-boot-v1");
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-state-validation-v1");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -33,7 +34,7 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 // Read safety
 const MAX_READ_FILE_BYTES = Number(process.env.MAX_READ_FILE_BYTES || 1024 * 1024);
 
-// OU-State boot safety
+// OU-State boot and validation safety
 const OU_STATE_REPO = process.env.OU_STATE_REPO || "Optical-Underground/OU-State";
 const OU_STATE_REF = process.env.OU_STATE_REF || "main";
 
@@ -197,6 +198,28 @@ async function getRepoCommitAndTree({ octokit, owner, repoName, ref }) {
     commit: commitSha,
     tree,
   };
+}
+
+async function loadOuStateValidationContext({ octokit, owner, repoName, ref, baseCommit, edits }) {
+  const snapshot = await getRepoCommitAndTree({ octokit, owner, repoName, ref });
+  const currentFile = await getTextFileFromRepo({
+    octokit,
+    owner,
+    repoName,
+    path: "ou_state.json",
+    ref: snapshot.commit,
+  });
+  const currentState = JSON.parse(currentFile.content);
+  const proposedState = getProposedOuState(edits, currentState);
+
+  return validateStateChange({
+    currentCommit: snapshot.commit,
+    baseCommit,
+    currentState,
+    proposedState,
+    existingPaths: snapshot.tree.filter((item) => item.type === "file").map((item) => item.path),
+    edits,
+  });
 }
 
 async function createPullRequestWithRetry({
@@ -417,6 +440,37 @@ async function handleStateBoot(req, res) {
   }
 }
 
+async function handleStateValidate(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  const { base_commit: baseCommit, edits = [], ref = OU_STATE_REF } = req.body || {};
+
+  if (!Array.isArray(edits)) {
+    return res.status(400).json({ error: "edits must be an array" });
+  }
+
+  if (!isRepoAllowed(OU_STATE_REPO)) {
+    return res.status(403).json({ error: "OU-State repo not allowed" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(OU_STATE_REPO);
+    const octokit = await getOctokitForRepo(owner, repoName);
+    const result = await loadOuStateValidationContext({
+      octokit,
+      owner,
+      repoName,
+      ref,
+      baseCommit,
+      edits,
+    });
+
+    res.status(result.ok ? 200 : 409).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err?.message || String(err) });
+  }
+}
+
 // --------------------
 // Health / Capabilities / Version
 // --------------------
@@ -440,6 +494,7 @@ app.get("/capabilities", async (req, res) => {
       read_file: true,
       prs_create: true,
       state_boot: true,
+      state_validate: true,
     },
     auth_mode: AUTH_MODE,
     allowed_repos: ALLOWED_REPOS,
@@ -459,7 +514,7 @@ app.get("/version", (_req, res) => {
     max_read_file_bytes: MAX_READ_FILE_BYTES,
     ou_state_repo: OU_STATE_REPO,
     ou_state_ref: OU_STATE_REF,
-    commit_mark: "bridge-state-boot-v1",
+    commit_mark: "bridge-state-validation-v1",
   });
 });
 
@@ -467,6 +522,7 @@ app.get("/version", (_req, res) => {
 // State
 // --------------------
 app.post("/state/boot", handleStateBoot);
+app.post("/state/validate", handleStateValidate);
 
 // --------------------
 // Read / Snapshot
@@ -485,6 +541,7 @@ app.post("/pr", async (req, res) => {
 
   const repo = req.body?.repo;
   const base = req.body?.base_ref ?? req.body?.base ?? "main";
+  const baseCommit = req.body?.base_commit ?? null;
   const branch = normalizeBranchName(
     req.body?.branch_name ??
       req.body?.branch ??
@@ -514,12 +571,30 @@ app.post("/pr", async (req, res) => {
     });
     const baseCommitSha = baseRef.data.object.sha;
 
-    const baseCommit = await octokit.git.getCommit({
+    if (repo === OU_STATE_REPO) {
+      const validation = await loadOuStateValidationContext({
+        octokit,
+        owner,
+        repoName,
+        ref: base,
+        baseCommit,
+        edits,
+      });
+
+      if (!validation.ok) {
+        return res.status(409).json({
+          error: "OU-State validation failed",
+          validation,
+        });
+      }
+    }
+
+    const baseCommitData = await octokit.git.getCommit({
       owner,
       repo: repoName,
       commit_sha: baseCommitSha,
     });
-    const baseTreeSha = baseCommit.data.tree.sha;
+    const baseTreeSha = baseCommitData.data.tree.sha;
 
     const treeItems = [];
 
