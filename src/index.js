@@ -3,7 +3,7 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
 import { buildStateBootPacket } from "./stateBoot.js";
-import { getProposedOuState, validateStateChange } from "./stateValidation.js";
+import { prepareOuStateWrite } from "./ouStateWritePreflight.js";
 
 console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-state-validation-v1");
 
@@ -196,30 +196,9 @@ async function getRepoCommitAndTree({ octokit, owner, repoName, ref }) {
 
   return {
     commit: commitSha,
+    treeSha,
     tree,
   };
-}
-
-async function loadOuStateValidationContext({ octokit, owner, repoName, ref, baseCommit, edits }) {
-  const snapshot = await getRepoCommitAndTree({ octokit, owner, repoName, ref });
-  const currentFile = await getTextFileFromRepo({
-    octokit,
-    owner,
-    repoName,
-    path: "ou_state.json",
-    ref: snapshot.commit,
-  });
-  const currentState = JSON.parse(currentFile.content);
-  const proposedState = getProposedOuState(edits, currentState);
-
-  return validateStateChange({
-    currentCommit: snapshot.commit,
-    baseCommit,
-    currentState,
-    proposedState,
-    existingPaths: snapshot.tree.filter((item) => item.type === "file").map((item) => item.path),
-    edits,
-  });
 }
 
 async function createPullRequestWithRetry({
@@ -440,6 +419,22 @@ async function handleStateBoot(req, res) {
   }
 }
 
+async function prepareLiveOuStateWrite({ octokit, owner, repoName, ref, baseCommit, edits }) {
+  return prepareOuStateWrite({
+    baseCommit,
+    edits,
+    resolveSnapshot: () => getRepoCommitAndTree({ octokit, owner, repoName, ref }),
+    readTextFile: (path, immutableRef) =>
+      getTextFileFromRepo({
+        octokit,
+        owner,
+        repoName,
+        path,
+        ref: immutableRef,
+      }),
+  });
+}
+
 async function handleStateValidate(req, res) {
   if (requireBridgeSecret(req, res)) return;
 
@@ -456,7 +451,7 @@ async function handleStateValidate(req, res) {
   try {
     const { owner, repo: repoName } = parseRepo(OU_STATE_REPO);
     const octokit = await getOctokitForRepo(owner, repoName);
-    const result = await loadOuStateValidationContext({
+    const { validation } = await prepareLiveOuStateWrite({
       octokit,
       owner,
       repoName,
@@ -465,7 +460,7 @@ async function handleStateValidate(req, res) {
       edits,
     });
 
-    res.status(result.ok ? 200 : 409).json(result);
+    res.status(validation.ok ? 200 : 409).json(validation);
   } catch (err) {
     res.status(400).json({ error: err?.message || String(err) });
   }
@@ -564,15 +559,11 @@ app.post("/pr", async (req, res) => {
     const { owner, repo: repoName } = parseRepo(repo);
     const octokit = await getOctokitForRepo(owner, repoName);
 
-    const baseRef = await octokit.git.getRef({
-      owner,
-      repo: repoName,
-      ref: `heads/${base}`,
-    });
-    const baseCommitSha = baseRef.data.object.sha;
+    let baseCommitSha;
+    let baseTreeSha;
 
     if (repo === OU_STATE_REPO) {
-      const validation = await loadOuStateValidationContext({
+      const { snapshot, validation } = await prepareLiveOuStateWrite({
         octokit,
         owner,
         repoName,
@@ -587,14 +578,24 @@ app.post("/pr", async (req, res) => {
           validation,
         });
       }
-    }
 
-    const baseCommitData = await octokit.git.getCommit({
-      owner,
-      repo: repoName,
-      commit_sha: baseCommitSha,
-    });
-    const baseTreeSha = baseCommitData.data.tree.sha;
+      baseCommitSha = snapshot.commit;
+      baseTreeSha = snapshot.treeSha;
+    } else {
+      const baseRef = await octokit.git.getRef({
+        owner,
+        repo: repoName,
+        ref: `heads/${base}`,
+      });
+      baseCommitSha = baseRef.data.object.sha;
+
+      const baseCommitData = await octokit.git.getCommit({
+        owner,
+        repo: repoName,
+        commit_sha: baseCommitSha,
+      });
+      baseTreeSha = baseCommitData.data.tree.sha;
+    }
 
     const treeItems = [];
 
