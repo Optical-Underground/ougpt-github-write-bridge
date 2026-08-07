@@ -7,8 +7,12 @@ import {
   formatStateValidationResponse,
   prepareOuStateWrite,
 } from "./ouStateWritePreflight.js";
+import {
+  buildProductionStatusPacket,
+  parseProductionTargets,
+} from "./productionStatus.js";
 
-console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-state-validation-v1");
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-production-status-v1");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -40,6 +44,15 @@ const MAX_READ_FILE_BYTES = Number(process.env.MAX_READ_FILE_BYTES || 1024 * 102
 // OU-State boot and validation safety
 const OU_STATE_REPO = process.env.OU_STATE_REPO || "Optical-Underground/OU-State";
 const OU_STATE_REF = process.env.OU_STATE_REF || "main";
+
+// Read-only production verification targets. URLs can only come from server configuration.
+const PRODUCTION_TARGETS = parseProductionTargets(process.env.PRODUCTION_TARGETS_JSON || "");
+const MAX_DEPLOYMENT_RESPONSE_BYTES = Number(
+  process.env.MAX_DEPLOYMENT_RESPONSE_BYTES || 256 * 1024
+);
+const DEPLOYMENT_PROBE_TIMEOUT_MS = Number(
+  process.env.DEPLOYMENT_PROBE_TIMEOUT_MS || 10_000
+);
 
 // --------------------
 // Helpers
@@ -298,6 +311,40 @@ async function getTextFileFromRepo({ octokit, owner, repoName, path, ref }) {
   };
 }
 
+async function fetchConfiguredDeploymentJson(url) {
+  const response = await fetch(url, {
+    headers: { accept: "application/json" },
+    redirect: "error",
+    signal: AbortSignal.timeout(DEPLOYMENT_PROBE_TIMEOUT_MS),
+  });
+
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (contentLength > MAX_DEPLOYMENT_RESPONSE_BYTES) {
+    throw new Error("deployment_response_too_large");
+  }
+
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_DEPLOYMENT_RESPONSE_BYTES) {
+    throw new Error("deployment_response_too_large");
+  }
+
+  let body = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new Error("deployment_response_not_json");
+    }
+  }
+
+  return {
+    ok: response.ok,
+    http_status: response.status,
+    body,
+    error: response.ok ? null : `deployment_http_${response.status}`,
+  };
+}
+
 async function handleReposSnapshot(req, res) {
   if (requireBridgeSecret(req, res)) return;
 
@@ -469,6 +516,73 @@ async function handleStateValidate(req, res) {
   }
 }
 
+async function handleProductionStatus(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  const repo = req.body?.repo;
+  const prNumber = Number(req.body?.pr_number);
+
+  if (!repo || !Number.isInteger(prNumber) || prNumber <= 0) {
+    return res.status(400).json({ error: "repo and positive integer pr_number required" });
+  }
+
+  if (!isRepoAllowed(repo)) {
+    return res.status(403).json({ error: "Repo not allowed" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+
+    const packet = await buildProductionStatusPacket({
+      repo,
+      prNumber,
+      target: PRODUCTION_TARGETS[repo] || null,
+      getPullRequest: async () => {
+        const response = await octokit.pulls.get({
+          owner,
+          repo: repoName,
+          pull_number: prNumber,
+        });
+        return response.data;
+      },
+      getReviews: async () => {
+        const response = await octokit.pulls.listReviews({
+          owner,
+          repo: repoName,
+          pull_number: prNumber,
+          per_page: 100,
+        });
+        return response.data;
+      },
+      getCheckRuns: async (ref) => {
+        const response = await octokit.checks.listForRef({
+          owner,
+          repo: repoName,
+          ref,
+          per_page: 100,
+        });
+        return response.data.check_runs || [];
+      },
+      getCombinedStatus: async (ref) => {
+        const response = await octokit.repos.getCombinedStatusForRef({
+          owner,
+          repo: repoName,
+          ref,
+          per_page: 100,
+        });
+        return response.data.state || "none";
+      },
+      fetchDeploymentJson: fetchConfiguredDeploymentJson,
+    });
+
+    return res.status(200).json(packet);
+  } catch (err) {
+    const status = err?.status === 404 ? 404 : 500;
+    return res.status(status).json({ error: err?.message || String(err) });
+  }
+}
+
 // --------------------
 // Health / Capabilities / Version
 // --------------------
@@ -493,12 +607,14 @@ app.get("/capabilities", async (req, res) => {
       prs_create: true,
       state_boot: true,
       state_validate: true,
+      production_status: true,
     },
     auth_mode: AUTH_MODE,
     allowed_repos: ALLOWED_REPOS,
     max_read_file_bytes: MAX_READ_FILE_BYTES,
     ou_state_repo: OU_STATE_REPO,
     ou_state_ref: OU_STATE_REF,
+    production_status_repos: Object.keys(PRODUCTION_TARGETS),
   });
 });
 
@@ -512,7 +628,8 @@ app.get("/version", (_req, res) => {
     max_read_file_bytes: MAX_READ_FILE_BYTES,
     ou_state_repo: OU_STATE_REPO,
     ou_state_ref: OU_STATE_REF,
-    commit_mark: "bridge-state-validation-v1",
+    production_status_repos: Object.keys(PRODUCTION_TARGETS),
+    commit_mark: "bridge-production-status-v1",
   });
 });
 
@@ -521,6 +638,11 @@ app.get("/version", (_req, res) => {
 // --------------------
 app.post("/state/boot", handleStateBoot);
 app.post("/state/validate", handleStateValidate);
+
+// --------------------
+// Production continuation (read-only)
+// --------------------
+app.post("/production/status", handleProductionStatus);
 
 // --------------------
 // Read / Snapshot

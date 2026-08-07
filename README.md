@@ -22,6 +22,8 @@ Tiny HTTP service that creates/updates branches and opens GitHub PRs from a sign
 
 \- `OU\_STATE\_REF` = authoritative state ref for `/state/boot` (defaults to `main`)
 
+\- `PRODUCTION\_TARGETS\_JSON` = optional JSON object keyed by `owner/repo`. Each target may define `name`, HTTPS `health_url`, HTTPS `version_url`, `commit_field` (defaults to `render_git_commit`), and `max_pending_minutes` (defaults to 20). URLs are server-configured so callers cannot probe arbitrary hosts.
+
 
 
 \## Diagnostics (optional)
@@ -51,6 +53,26 @@ Optional payload:
 ```
 
 The endpoint is read-only. It reads OU-State, records the exact source commit, preserves the configured active-front list, reports missing mappings or unreadable front files explicitly, summarizes current-work and coordination files, and reports newest relevant recaps without mutating GitHub or deployment state.
+
+
+
+\## Production status
+
+`POST /production/status` with header `x-bridge-secret: <secret>`
+
+```json
+
+{
+
+&nbsp; "repo": "Optical-Underground/ougpt-github-write-bridge",
+
+&nbsp; "pr_number": 8
+
+}
+
+```
+
+The endpoint is read-only. It reports the PR head and merge commits, draft and mergeability state, observed reviews and checks, and—when the repo has a server-configured production target—compares the exact merge commit with commit evidence returned by the target health or version endpoint. It never merges, deploys, edits GitHub, or accepts caller-supplied probe URLs.
 
 
 
@@ -85,6 +107,5 @@ Example payload:
 &nbsp; ]
 
 }
-
 
 
