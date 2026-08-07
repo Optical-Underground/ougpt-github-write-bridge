@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { prepareOuStateWrite } from "../src/ouStateWritePreflight.js";
+import {
+  formatStateValidationResponse,
+  prepareOuStateWrite,
+} from "../src/ouStateWritePreflight.js";
 
 function makeFixture(baseCommit) {
   const calls = {
@@ -135,5 +138,33 @@ test("valid base_commit returns the immutable commit and tree for the write phas
   assert.deepEqual(fixture.calls.readTextFile, [
     { path: "ou_state.json", ref: "commit-current" },
   ]);
+  assertZeroMutations(fixture.calls);
+});
+
+test("formats a completed invalid validation as a successful transport response", () => {
+  const validation = {
+    ok: false,
+    errors: [{ code: "stale_base_commit", message: "stale" }],
+    warnings: [],
+    current_commit: "commit-current",
+    base_commit: "commit-stale",
+  };
+
+  const response = formatStateValidationResponse(validation);
+
+  assert.equal(response.ok, true);
+  assert.equal(response.valid, false);
+  assert.deepEqual(response.errors, validation.errors);
+  assert.equal(validation.ok, false);
+});
+
+test("transport wrapping does not weaken the invalid write guard", async () => {
+  const fixture = makeFixture("commit-stale");
+  const result = await runGuardedMutation(fixture);
+  const response = formatStateValidationResponse(result.validation);
+
+  assert.equal(response.ok, true);
+  assert.equal(response.valid, false);
+  assert.equal(result.validation.ok, false);
   assertZeroMutations(fixture.calls);
 });

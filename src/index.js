@@ -3,7 +3,10 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
 import { buildStateBootPacket } from "./stateBoot.js";
-import { prepareOuStateWrite } from "./ouStateWritePreflight.js";
+import {
+  formatStateValidationResponse,
+  prepareOuStateWrite,
+} from "./ouStateWritePreflight.js";
 
 console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-state-validation-v1");
 
@@ -460,7 +463,7 @@ async function handleStateValidate(req, res) {
       edits,
     });
 
-    res.status(validation.ok ? 200 : 409).json(validation);
+    res.status(200).json(formatStateValidationResponse(validation));
   } catch (err) {
     res.status(400).json({ error: err?.message || String(err) });
   }

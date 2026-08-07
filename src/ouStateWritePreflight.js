@@ -27,3 +27,12 @@ export async function prepareOuStateWrite({
     validation,
   };
 }
+
+export function formatStateValidationResponse(validation) {
+  const { ok: valid, ...details } = validation;
+  return {
+    ok: true,
+    valid,
+    ...details,
+  };
+}
