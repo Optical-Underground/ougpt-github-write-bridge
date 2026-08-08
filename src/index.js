@@ -9,10 +9,23 @@ import {
 } from "./ouStateWritePreflight.js";
 import {
   buildProductionStatusPacket,
+  observeProductionTarget,
   parseProductionTargets,
 } from "./productionStatus.js";
+import {
+  createAuthorizationConsumer,
+  issueActionAuthorization,
+} from "./actionAuthorization.js";
+import {
+  assertAuthorizedRequestMatches,
+  evaluateDeploymentObservation,
+  evaluateDeploymentReadiness,
+  evaluateMergeReadiness,
+  parseDeploymentHooks,
+  triggerExactCommitDeploy,
+} from "./guardedExecution.js";
 
-console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-production-status-v1");
+console.log("BRIDGE_BUILD", new Date().toISOString(), "COMMIT_MARK=bridge-guarded-execution-v1");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -54,6 +67,17 @@ const DEPLOYMENT_PROBE_TIMEOUT_MS = Number(
   process.env.DEPLOYMENT_PROBE_TIMEOUT_MS || 10_000
 );
 
+// High-risk actions use a short-lived, signed, single-use authorization issued only after
+// a fresh read-only preflight. Render deploy-hook URLs remain server-side secrets.
+const ACTION_AUTHORIZATION_SECRET = process.env.ACTION_AUTHORIZATION_SECRET || BRIDGE_SECRET;
+const ACTION_AUTHORIZATION_TTL_SECONDS = Number(
+  process.env.ACTION_AUTHORIZATION_TTL_SECONDS || 300
+);
+const DEPLOYMENT_HOOKS = parseDeploymentHooks(process.env.DEPLOYMENT_HOOKS_JSON || "");
+const consumeActionAuthorization = createAuthorizationConsumer({
+  secret: ACTION_AUTHORIZATION_SECRET,
+});
+
 // --------------------
 // Helpers
 // --------------------
@@ -81,6 +105,10 @@ function requireBridgeSecret(req, res) {
 
 function isRepoAllowed(fullRepo) {
   if (!ALLOWED_REPOS.length) return true;
+  return ALLOWED_REPOS.includes(fullRepo);
+}
+
+function isRepoExplicitlyAllowedForExecution(fullRepo) {
   return ALLOWED_REPOS.includes(fullRepo);
 }
 
@@ -345,6 +373,59 @@ async function fetchConfiguredDeploymentJson(url) {
   };
 }
 
+async function getPullContext({ octokit, owner, repoName, prNumber }) {
+  const pullResponse = await octokit.pulls.get({
+    owner,
+    repo: repoName,
+    pull_number: prNumber,
+  });
+  const pull = pullResponse.data;
+  const [reviewsResponse, checkRunsResponse, combinedStatusResponse] = await Promise.all([
+    octokit.pulls.listReviews({
+      owner,
+      repo: repoName,
+      pull_number: prNumber,
+      per_page: 100,
+    }),
+    octokit.checks.listForRef({
+      owner,
+      repo: repoName,
+      ref: pull.head.sha,
+      per_page: 100,
+    }),
+    octokit.repos.getCombinedStatusForRef({
+      owner,
+      repo: repoName,
+      ref: pull.head.sha,
+      per_page: 100,
+    }),
+  ]);
+
+  return {
+    pull,
+    reviews: reviewsResponse.data || [],
+    checkRuns: checkRunsResponse.data.check_runs || [],
+    combinedStatus: {
+      state: combinedStatusResponse.data.state || "none",
+      total_count:
+        combinedStatusResponse.data.total_count || combinedStatusResponse.data.statuses?.length || 0,
+    },
+  };
+}
+
+function parsePositivePrNumber(value) {
+  const prNumber = Number(value);
+  return Number.isInteger(prNumber) && prNumber > 0 ? prNumber : null;
+}
+
+function authorizationErrorStatus(err) {
+  const message = err?.message || String(err);
+  if (message.startsWith("authorization_token_")) return 400;
+  if (err?.status === 404) return 404;
+  if (err?.status === 405 || err?.status === 409 || err?.status === 422) return 409;
+  return 500;
+}
+
 async function handleReposSnapshot(req, res) {
   if (requireBridgeSecret(req, res)) return;
 
@@ -571,7 +652,10 @@ async function handleProductionStatus(req, res) {
           ref,
           per_page: 100,
         });
-        return response.data.state || "none";
+        return {
+          state: response.data.state || "none",
+          total_count: response.data.total_count || response.data.statuses?.length || 0,
+        };
       },
       fetchDeploymentJson: fetchConfiguredDeploymentJson,
     });
@@ -580,6 +664,341 @@ async function handleProductionStatus(req, res) {
   } catch (err) {
     const status = err?.status === 404 ? 404 : 500;
     return res.status(status).json({ error: err?.message || String(err) });
+  }
+}
+
+async function handleMergePrepare(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  const repo = req.body?.repo;
+  const prNumber = parsePositivePrNumber(req.body?.pr_number);
+  const expectedHeadCommit = req.body?.expected_head_commit;
+
+  if (!repo || !prNumber || !expectedHeadCommit) {
+    return res.status(400).json({
+      error: "repo, positive integer pr_number, and expected_head_commit required",
+    });
+  }
+  if (!isRepoExplicitlyAllowedForExecution(repo)) {
+    return res.status(403).json({ error: "Repo not explicitly allowed for guarded execution" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+    const context = await getPullContext({ octokit, owner, repoName, prNumber });
+    const readiness = evaluateMergeReadiness({
+      pull: context.pull,
+      expectedHeadCommit,
+      expectedBaseCommit: context.pull.base.sha,
+      reviews: context.reviews,
+      checkRuns: context.checkRuns,
+      combinedStatus: context.combinedStatus,
+    });
+
+    if (!readiness.ready) {
+      return res.status(200).json({ ok: true, ready: false, ...readiness });
+    }
+
+    const authorization = issueActionAuthorization({
+      secret: ACTION_AUTHORIZATION_SECRET,
+      operation: "merge",
+      details: {
+        repo,
+        pr_number: prNumber,
+        expected_head_commit: expectedHeadCommit,
+        expected_base_commit: context.pull.base.sha,
+        merge_method: "merge",
+      },
+      ttlSeconds: ACTION_AUTHORIZATION_TTL_SECONDS,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      ready: true,
+      errors: [],
+      snapshot: readiness.snapshot,
+      authorization_token: authorization.token,
+      expires_at: authorization.payload.expires_at,
+      expected_base_commit: context.pull.base.sha,
+      approval_required: true,
+    });
+  } catch (err) {
+    return res.status(err?.status === 404 ? 404 : 500).json({
+      error: err?.message || String(err),
+    });
+  }
+}
+
+async function handleMergeExecute(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  try {
+    const authorization = consumeActionAuthorization({
+      token: req.body?.authorization_token,
+      operation: "merge",
+    });
+    const {
+      repo,
+      pr_number: prNumber,
+      expected_head_commit: expectedHeadCommit,
+      expected_base_commit: expectedBaseCommit,
+    } = authorization.details || {};
+    assertAuthorizedRequestMatches({
+      authorizationDetails: authorization.details,
+      requestDetails: {
+        repo: req.body?.repo,
+        pr_number: req.body?.pr_number,
+        expected_head_commit: req.body?.expected_head_commit,
+        expected_base_commit: req.body?.expected_base_commit,
+      },
+      fields: ["repo", "pr_number", "expected_head_commit", "expected_base_commit"],
+    });
+
+    if (!repo || !parsePositivePrNumber(prNumber) || !expectedHeadCommit || !expectedBaseCommit) {
+      throw new Error("authorization_token_scope_mismatch");
+    }
+    if (!isRepoExplicitlyAllowedForExecution(repo)) {
+      return res.status(403).json({ error: "Repo not explicitly allowed for guarded execution" });
+    }
+
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+    const context = await getPullContext({ octokit, owner, repoName, prNumber });
+    const readiness = evaluateMergeReadiness({
+      pull: context.pull,
+      expectedHeadCommit,
+      expectedBaseCommit,
+      reviews: context.reviews,
+      checkRuns: context.checkRuns,
+      combinedStatus: context.combinedStatus,
+    });
+
+    if (!readiness.ready) {
+      return res.status(200).json({
+        ok: true,
+        executed: false,
+        valid: false,
+        ...readiness,
+      });
+    }
+
+    const response = await octokit.pulls.merge({
+      owner,
+      repo: repoName,
+      pull_number: prNumber,
+      merge_method: "merge",
+      sha: expectedHeadCommit,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      executed: Boolean(response.data.merged),
+      merged: Boolean(response.data.merged),
+      merge_commit: response.data.sha || null,
+      message: response.data.message || null,
+      repo,
+      pr_number: prNumber,
+      expected_head_commit: expectedHeadCommit,
+      expected_base_commit: expectedBaseCommit,
+      rollback: {
+        pre_merge_base_commit: expectedBaseCommit,
+        merged_head_commit: expectedHeadCommit,
+      },
+    });
+  } catch (err) {
+    return res.status(authorizationErrorStatus(err)).json({
+      error: err?.message || String(err),
+    });
+  }
+}
+
+async function handleDeploymentPrepare(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  const repo = req.body?.repo;
+  const prNumber = parsePositivePrNumber(req.body?.pr_number);
+  const expectedMergeCommit = req.body?.expected_merge_commit;
+
+  if (!repo || !prNumber || !expectedMergeCommit) {
+    return res.status(400).json({
+      error: "repo, positive integer pr_number, and expected_merge_commit required",
+    });
+  }
+  if (!isRepoExplicitlyAllowedForExecution(repo)) {
+    return res.status(403).json({ error: "Repo not explicitly allowed for guarded execution" });
+  }
+
+  try {
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+    const response = await octokit.pulls.get({
+      owner,
+      repo: repoName,
+      pull_number: prNumber,
+    });
+    const readiness = evaluateDeploymentReadiness({
+      pull: response.data,
+      expectedMergeCommit,
+      target: PRODUCTION_TARGETS[repo] || null,
+      hook: DEPLOYMENT_HOOKS[repo] || null,
+    });
+
+    if (!readiness.ready) {
+      return res.status(200).json({ ok: true, ready: false, ...readiness });
+    }
+
+    const target = PRODUCTION_TARGETS[repo];
+    const observation = await observeProductionTarget({
+      target,
+      fetchDeploymentJson: fetchConfiguredDeploymentJson,
+    });
+    const deploymentState = evaluateDeploymentObservation({
+      observation,
+      expectedMergeCommit,
+    });
+    if (!deploymentState.ready) {
+      return res.status(200).json({
+        ok: true,
+        ready: false,
+        ...deploymentState,
+        snapshot: readiness.snapshot,
+      });
+    }
+
+    const authorization = issueActionAuthorization({
+      secret: ACTION_AUTHORIZATION_SECRET,
+      operation: "deploy",
+      details: {
+        repo,
+        pr_number: prNumber,
+        expected_merge_commit: expectedMergeCommit,
+        expected_previous_commit: deploymentState.observed_commit,
+      },
+      ttlSeconds: ACTION_AUTHORIZATION_TTL_SECONDS,
+    });
+
+    return res.status(200).json({
+      ok: true,
+      ready: true,
+      errors: [],
+      snapshot: readiness.snapshot,
+      authorization_token: authorization.token,
+      expires_at: authorization.payload.expires_at,
+      expected_previous_commit: deploymentState.observed_commit,
+      rollback_commit: deploymentState.rollback_commit,
+      approval_required: true,
+    });
+  } catch (err) {
+    return res.status(err?.status === 404 ? 404 : 500).json({
+      error: err?.message || String(err),
+    });
+  }
+}
+
+async function handleDeploymentExecute(req, res) {
+  if (requireBridgeSecret(req, res)) return;
+
+  try {
+    const authorization = consumeActionAuthorization({
+      token: req.body?.authorization_token,
+      operation: "deploy",
+    });
+    const {
+      repo,
+      pr_number: prNumber,
+      expected_merge_commit: expectedMergeCommit,
+      expected_previous_commit: expectedPreviousCommit,
+    } = authorization.details || {};
+    assertAuthorizedRequestMatches({
+      authorizationDetails: authorization.details,
+      requestDetails: {
+        repo: req.body?.repo,
+        pr_number: req.body?.pr_number,
+        expected_merge_commit: req.body?.expected_merge_commit,
+        expected_previous_commit: req.body?.expected_previous_commit,
+      },
+      fields: ["repo", "pr_number", "expected_merge_commit", "expected_previous_commit"],
+    });
+
+    if (!repo || !parsePositivePrNumber(prNumber) || !expectedMergeCommit || !expectedPreviousCommit) {
+      throw new Error("authorization_token_scope_mismatch");
+    }
+    if (!isRepoExplicitlyAllowedForExecution(repo)) {
+      return res.status(403).json({ error: "Repo not explicitly allowed for guarded execution" });
+    }
+
+    const { owner, repo: repoName } = parseRepo(repo);
+    const octokit = await getOctokitForRepo(owner, repoName);
+    const response = await octokit.pulls.get({
+      owner,
+      repo: repoName,
+      pull_number: prNumber,
+    });
+    const target = PRODUCTION_TARGETS[repo] || null;
+    const hook = DEPLOYMENT_HOOKS[repo] || null;
+    const readiness = evaluateDeploymentReadiness({
+      pull: response.data,
+      expectedMergeCommit,
+      target,
+      hook,
+    });
+
+    if (!readiness.ready) {
+      return res.status(200).json({
+        ok: true,
+        executed: false,
+        valid: false,
+        ...readiness,
+      });
+    }
+
+    const observation = await observeProductionTarget({
+      target,
+      fetchDeploymentJson: fetchConfiguredDeploymentJson,
+    });
+    const deploymentState = evaluateDeploymentObservation({
+      observation,
+      expectedMergeCommit,
+      expectedPreviousCommit,
+    });
+    if (deploymentState.already_deployed) {
+      return res.status(200).json({
+        ok: true,
+        executed: false,
+        already_deployed: true,
+        repo,
+        pr_number: prNumber,
+        commit: expectedMergeCommit,
+      });
+    }
+    if (!deploymentState.ready) {
+      return res.status(200).json({
+        ok: true,
+        executed: false,
+        valid: false,
+        ...deploymentState,
+      });
+    }
+
+    const deployment = await triggerExactCommitDeploy({
+      hookUrl: hook.hookUrl,
+      commit: expectedMergeCommit,
+    });
+    return res.status(200).json({
+      ok: true,
+      executed: true,
+      already_deployed: false,
+      repo,
+      pr_number: prNumber,
+      ...deployment,
+      previous_observed_commit: deploymentState.observed_commit,
+      rollback_commit: deploymentState.rollback_commit,
+    });
+  } catch (err) {
+    return res.status(authorizationErrorStatus(err)).json({
+      error: err?.message || String(err),
+    });
   }
 }
 
@@ -608,6 +1027,10 @@ app.get("/capabilities", async (req, res) => {
       state_boot: true,
       state_validate: true,
       production_status: true,
+      merge_prepare: true,
+      merge_execute: true,
+      deployment_prepare: true,
+      deployment_execute: true,
     },
     auth_mode: AUTH_MODE,
     allowed_repos: ALLOWED_REPOS,
@@ -615,6 +1038,8 @@ app.get("/capabilities", async (req, res) => {
     ou_state_repo: OU_STATE_REPO,
     ou_state_ref: OU_STATE_REF,
     production_status_repos: Object.keys(PRODUCTION_TARGETS),
+    deployment_hook_repos: Object.keys(DEPLOYMENT_HOOKS),
+    guarded_execution_requires_explicit_allowlist: true,
   });
 });
 
@@ -629,7 +1054,9 @@ app.get("/version", (_req, res) => {
     ou_state_repo: OU_STATE_REPO,
     ou_state_ref: OU_STATE_REF,
     production_status_repos: Object.keys(PRODUCTION_TARGETS),
-    commit_mark: "bridge-production-status-v1",
+    deployment_hook_repos: Object.keys(DEPLOYMENT_HOOKS),
+    guarded_execution_requires_explicit_allowlist: true,
+    commit_mark: "bridge-guarded-execution-v1",
   });
 });
 
@@ -643,6 +1070,14 @@ app.post("/state/validate", handleStateValidate);
 // Production continuation (read-only)
 // --------------------
 app.post("/production/status", handleProductionStatus);
+
+// --------------------
+// Guarded high-risk execution
+// --------------------
+app.post("/pr/merge-prepare", handleMergePrepare);
+app.post("/pr/merge-execute", handleMergeExecute);
+app.post("/deployment/prepare", handleDeploymentPrepare);
+app.post("/deployment/execute", handleDeploymentExecute);
 
 // --------------------
 // Read / Snapshot

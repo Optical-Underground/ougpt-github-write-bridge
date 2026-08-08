@@ -27,7 +27,7 @@ function fixture(overrides = {}) {
     getPullRequest: async () => pull,
     getReviews: async () => [],
     getCheckRuns: async () => [],
-    getCombinedStatus: async () => "success",
+    getCombinedStatus: async () => ({ state: "success", total_count: 1 }),
     fetchDeploymentJson: async () => {
       throw new Error("deployment probe should not run");
     },
@@ -85,6 +85,22 @@ test("summarizes failed, pending, and passing checks", () => {
     summarizeChecks([{ status: "completed", conclusion: "success" }], "success").state,
     "passing"
   );
+});
+
+test("normalizes GitHub's empty pending combined status to no checks", () => {
+  const summary = summarizeChecks([], { state: "pending", total_count: 0 });
+  assert.equal(summary.state, "none");
+  assert.equal(summary.commit_status, "pending");
+  assert.equal(summary.total, 0);
+});
+
+test("does not let an empty combined status hide passing check runs", () => {
+  const summary = summarizeChecks(
+    [{ status: "completed", conclusion: "success" }],
+    { state: "pending", total_count: 0 }
+  );
+  assert.equal(summary.state, "passing");
+  assert.equal(summary.passed, 1);
 });
 
 test("open clean PR awaits high-risk merge approval without probing deployment", async () => {
