@@ -1,0 +1,394 @@
+openapi: 3.1.0
+info:
+  title: OUGPT GitHub Write Bridge
+  version: 2.0.0
+  description: Read/write bridge for approved Optical Underground GitHub repositories.
+servers:
+  - url: https://ougpt-github-write-bridge.onrender.com
+security:
+  - BridgeSecret: []
+components:
+  securitySchemes:
+    BridgeSecret:
+      type: apiKey
+      in: header
+      name: x-bridge-secret
+  schemas:
+    RepoRefRequest:
+      type: object
+      required: [repo]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/OU-State
+        ref:
+          type: string
+          default: main
+
+    SnapshotRequest:
+      type: object
+      required: [repo]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/OU-State
+        ref:
+          type: string
+          default: main
+        depth:
+          type: integer
+          default: 3
+        paths:
+          type: array
+          items:
+            type: string
+
+    ReadFileRequest:
+      type: object
+      required: [repo, path]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/OU-State
+        ref:
+          type: string
+          default: main
+        path:
+          type: string
+          example: current_work.md
+
+    StateBootRequest:
+      type: object
+      properties:
+        front:
+          type: string
+          description: Optional active front to boot. Omit to return all configured active fronts.
+          example: pos-for-optical
+        project:
+          type: string
+          description: Optional alias for front.
+          example: pos-for-optical
+        ref:
+          type: string
+          default: main
+          description: OU-State Git ref. Defaults to the bridge OU_STATE_REF setting.
+
+    StateValidateRequest:
+      type: object
+      properties:
+        base_commit:
+          type: string
+          description: Exact OU-State commit SHA the proposed edits were based on.
+        ref:
+          type: string
+          default: main
+        edits:
+          type: array
+          items:
+            $ref: '#/components/schemas/Edit'
+          default: []
+
+    ProductionStatusRequest:
+      type: object
+      required: [repo, pr_number]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/ougpt-github-write-bridge
+        pr_number:
+          type: integer
+          minimum: 1
+
+    Edit:
+      type: object
+      required: [path, action]
+      properties:
+        path:
+          type: string
+        action:
+          type: string
+          enum: [create, update, delete]
+        content:
+          type: string
+
+    PrRequest:
+      type: object
+      required: [repo, title, edits]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/OU-State
+        base_ref:
+          type: string
+          default: main
+        base_commit:
+          type: string
+          description: Required for OU-State writes and must match the exact current commit.
+        branch_name:
+          type: string
+        title:
+          type: string
+        body:
+          type: string
+        draft:
+          type: boolean
+          default: false
+        edits:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Edit'
+
+    MergePrepareRequest:
+      type: object
+      required: [repo, pr_number, expected_head_commit]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/ougpt-github-write-bridge
+        pr_number:
+          type: integer
+          minimum: 1
+        expected_head_commit:
+          type: string
+          description: Exact reviewed PR head commit.
+
+    MergeExecuteRequest:
+      type: object
+      required:
+        [authorization_token, repo, pr_number, expected_head_commit, expected_base_commit]
+      properties:
+        authorization_token:
+          type: string
+          description: Short-lived signed token returned by mergePrepare.
+        repo:
+          type: string
+          description: Must exactly match the signed repository.
+        pr_number:
+          type: integer
+          minimum: 1
+          description: Must exactly match the signed PR number.
+        expected_head_commit:
+          type: string
+          description: Must exactly match the signed reviewed PR head commit.
+        expected_base_commit:
+          type: string
+          description: Must exactly match the base commit captured by mergePrepare.
+
+    DeploymentPrepareRequest:
+      type: object
+      required: [repo, pr_number, expected_merge_commit]
+      properties:
+        repo:
+          type: string
+          example: Optical-Underground/ougpt-github-write-bridge
+        pr_number:
+          type: integer
+          minimum: 1
+        expected_merge_commit:
+          type: string
+          description: Exact merged PR commit intended for production.
+
+    DeploymentExecuteRequest:
+      type: object
+      required:
+        [authorization_token, repo, pr_number, expected_merge_commit, expected_previous_commit]
+      properties:
+        authorization_token:
+          type: string
+          description: Short-lived signed token returned by deploymentPrepare.
+        repo:
+          type: string
+          description: Must exactly match the signed repository.
+        pr_number:
+          type: integer
+          minimum: 1
+          description: Must exactly match the signed PR number.
+        expected_merge_commit:
+          type: string
+          description: Must exactly match the signed merged commit.
+        expected_previous_commit:
+          type: string
+          description: Must exactly match the production commit captured by deploymentPrepare.
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Check bridge health
+      responses:
+        '200':
+          description: OK
+
+  /version:
+    get:
+      operationId: getVersion
+      summary: Get deployed bridge version information
+      responses:
+        '200':
+          description: Version information
+
+  /capabilities:
+    get:
+      operationId: getCapabilities
+      summary: Get bridge capabilities and allowed repositories
+      responses:
+        '200':
+          description: Capabilities information
+
+  /state/boot:
+    post:
+      operationId: stateBoot
+      summary: Read the authoritative OU-State boot packet
+      description: Returns a read-only source-backed packet without changing GitHub or deployment state.
+      x-openai-isConsequential: false
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StateBootRequest'
+      responses:
+        '200':
+          description: Authoritative OU-State boot packet
+
+  /state/validate:
+    post:
+      operationId: stateValidate
+      summary: Validate a proposed OU-State change without writing
+      description: Returns valid true or false without GitHub mutations.
+      x-openai-isConsequential: false
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StateValidateRequest'
+      responses:
+        '200':
+          description: Completed validation result
+
+  /production/status:
+    post:
+      operationId: productionStatus
+      summary: Read PR and exact production deployment status
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductionStatusRequest'
+      responses:
+        '200':
+          description: Source and deployment status packet
+
+  /pr/merge-prepare:
+    post:
+      operationId: mergePrepare
+      summary: Prepare an exact PR merge authorization without merging
+      description: Rechecks the head, base, reviews, checks, and mergeability, then returns a short-lived signed authorization when ready.
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergePrepareRequest'
+      responses:
+        '200':
+          description: Readiness result and, when ready, short-lived authorization
+
+  /pr/merge-execute:
+    post:
+      operationId: mergeExecute
+      summary: Merge one exact approved PR
+      description: Consequential action. Revalidates the signed head and base before using GitHub's normal merge operation.
+      x-openai-isConsequential: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeExecuteRequest'
+      responses:
+        '200':
+          description: Merge executed or safely rejected
+
+  /deployment/prepare:
+    post:
+      operationId: deploymentPrepare
+      summary: Prepare an exact-commit Render deployment authorization without deploying
+      description: Confirms an exact merged PR commit, server-side target configuration, and the exact commit currently live for rollback and stale-deployment protection.
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentPrepareRequest'
+      responses:
+        '200':
+          description: Readiness result and, when ready, short-lived authorization
+
+  /deployment/execute:
+    post:
+      operationId: deploymentExecute
+      summary: Deploy one exact approved merge commit to Render
+      description: Consequential action. Revalidates the merged PR and unchanged live commit, then triggers only the server-stored Render hook with the exact commit ref.
+      x-openai-isConsequential: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentExecuteRequest'
+      responses:
+        '200':
+          description: Deployment accepted, already deployed, or safely rejected
+
+  /repos/snapshot:
+    post:
+      operationId: reposSnapshot
+      summary: Get a repository tree snapshot and optionally read selected files
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SnapshotRequest'
+      responses:
+        '200':
+          description: Snapshot result
+
+  /repos/read-file:
+    post:
+      operationId: readFile
+      summary: Read one text file from an approved repository
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReadFileRequest'
+      responses:
+        '200':
+          description: File contents
+
+  /pr:
+    post:
+      operationId: createPullRequest
+      summary: Create a branch, apply edits, and open a pull request
+      description: Creates reviewable GitHub changes but does not merge or deploy them.
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrRequest'
+      responses:
+        '200':
+          description: Pull request created

@@ -111,11 +111,29 @@ export function summarizeChecks(checkRuns = [], combinedStatus = null) {
     else counts.passed += 1;
   }
 
-  const commitStatus = String(combinedStatus || "").toLowerCase() || "none";
+  const commitStatusValue =
+    combinedStatus && typeof combinedStatus === "object"
+      ? combinedStatus.state
+      : combinedStatus;
+  const commitStatus = String(commitStatusValue || "").toLowerCase() || "none";
+  const combinedTotal =
+    combinedStatus && typeof combinedStatus === "object"
+      ? Number(combinedStatus.total_count || 0)
+      : commitStatus === "none"
+        ? 0
+        : 1;
+  const hasObservedChecks = counts.total > 0 || combinedTotal > 0;
   let state = "none";
-  if (counts.failed > 0 || commitStatus === "failure" || commitStatus === "error") state = "failed";
-  else if (counts.pending > 0 || commitStatus === "pending") state = "pending";
-  else if (counts.total > 0 || commitStatus === "success") state = "passing";
+  if (
+    counts.failed > 0 ||
+    (combinedTotal > 0 && (commitStatus === "failure" || commitStatus === "error"))
+  ) {
+    state = "failed";
+  } else if (counts.pending > 0 || (combinedTotal > 0 && commitStatus === "pending")) {
+    state = "pending";
+  } else if (hasObservedChecks) {
+    state = "passing";
+  }
 
   return {
     state,
@@ -133,6 +151,45 @@ function minutesSince(timestamp, now) {
   const then = Date.parse(timestamp || "");
   if (!Number.isFinite(then)) return null;
   return Math.max(0, (now.getTime() - then) / 60000);
+}
+
+export async function observeProductionTarget({ target, fetchDeploymentJson }) {
+  if (!target) {
+    return {
+      health: null,
+      version: null,
+      observed_commit: null,
+      probe_failed: false,
+    };
+  }
+
+  const probe = async (url) => {
+    if (!url) return null;
+    try {
+      return await fetchDeploymentJson(url);
+    } catch (err) {
+      return {
+        ok: false,
+        http_status: null,
+        body: null,
+        error: err?.message || String(err),
+      };
+    }
+  };
+
+  const [health, version] = await Promise.all([
+    probe(target.healthUrl),
+    probe(target.versionUrl),
+  ]);
+  const observedCommit =
+    readCommit(version?.body, target.commitField) || readCommit(health?.body, target.commitField);
+
+  return {
+    health,
+    version,
+    observed_commit: observedCommit,
+    probe_failed: Boolean((health && !health.ok) || (version && !version.ok)),
+  };
 }
 
 export async function buildProductionStatusPacket({
@@ -205,32 +262,14 @@ export async function buildProductionStatusPacket({
     return packet;
   }
 
-  const probe = async (url) => {
-    if (!url) return null;
-    try {
-      return await fetchDeploymentJson(url);
-    } catch (err) {
-      return {
-        ok: false,
-        http_status: null,
-        body: null,
-        error: err?.message || String(err),
-      };
-    }
-  };
+  const observation = await observeProductionTarget({ target, fetchDeploymentJson });
+  packet.deployment.health = observation.health;
+  packet.deployment.version = observation.version;
 
-  const [health, version] = await Promise.all([
-    probe(target.healthUrl),
-    probe(target.versionUrl),
-  ]);
-  packet.deployment.health = health;
-  packet.deployment.version = version;
-
-  const observedCommit =
-    readCommit(version?.body, target.commitField) || readCommit(health?.body, target.commitField);
+  const observedCommit = observation.observed_commit;
   packet.deployment.observed_commit = observedCommit;
 
-  if ((health && !health.ok) || (version && !version.ok)) {
+  if (observation.probe_failed) {
     packet.deployment.status = "probe_failed";
     packet.next_action = "investigate_deployment_probe";
     return packet;
