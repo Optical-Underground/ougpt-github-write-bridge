@@ -1,0 +1,1 @@
+Bridge smoke test succeeded.
