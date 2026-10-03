@@ -204,14 +204,28 @@ export async function buildProductionStatusPacket({
   now = new Date(),
 }) {
   const pull = await getPullRequest();
-  const [reviews, checkRuns, combinedStatus] = await Promise.all([
+  const [reviews, combinedStatus] = await Promise.all([
     getReviews(),
-    getCheckRuns(pull.head.sha),
     getCombinedStatus(pull.head.sha),
   ]);
 
+  let checkRuns = [];
+  let checkRunsAvailable = true;
+  let checkRunsErrorStatus = null;
+  try {
+    checkRuns = await getCheckRuns(pull.head.sha);
+  } catch (err) {
+    if (err?.status !== 403) throw err;
+    checkRunsAvailable = false;
+    checkRunsErrorStatus = 403;
+  }
+
   const reviewSummary = summarizeReviews(reviews);
-  const checkSummary = summarizeChecks(checkRuns, combinedStatus);
+  const checkSummary = {
+    ...summarizeChecks(checkRuns, combinedStatus),
+    check_runs_available: checkRunsAvailable,
+    check_runs_error_status: checkRunsErrorStatus,
+  };
   const merged = Boolean(pull.merged);
   const expectedCommit = merged ? pull.merge_commit_sha || null : null;
 
