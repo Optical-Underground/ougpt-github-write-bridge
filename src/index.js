@@ -2,6 +2,7 @@ import crypto from "crypto";
 import express from "express";
 import jwt from "jsonwebtoken";
 import { Octokit } from "@octokit/rest";
+import { createVerificationClient, readGitHubVerification } from "./verificationClient.js";
 import { buildStateBootPacket } from "./stateBoot.js";
 import {
   formatStateValidationResponse,
@@ -50,6 +51,7 @@ const INSTALLATION_ID = process.env.GITHUB_APP_INSTALLATION_ID;
 
 // PAT fallback
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GH_TOKEN = process.env.GH_TOKEN;
 
 // Read safety
 const MAX_READ_FILE_BYTES = Number(process.env.MAX_READ_FILE_BYTES || 1024 * 1024);
@@ -380,36 +382,30 @@ async function getPullContext({ octokit, owner, repoName, prNumber }) {
     pull_number: prNumber,
   });
   const pull = pullResponse.data;
-  const [reviewsResponse, checkRunsResponse, combinedStatusResponse] = await Promise.all([
+  const verificationClient = createVerificationClient({
+    primaryClient: octokit,
+    authMode: AUTH_MODE,
+    verificationToken: GH_TOKEN,
+  });
+  const [reviewsResponse, verification] = await Promise.all([
     octokit.pulls.listReviews({
       owner,
       repo: repoName,
       pull_number: prNumber,
       per_page: 100,
     }),
-    octokit.checks.listForRef({
+    readGitHubVerification({
+      client: verificationClient,
       owner,
       repo: repoName,
       ref: pull.head.sha,
-      per_page: 100,
-    }),
-    octokit.repos.getCombinedStatusForRef({
-      owner,
-      repo: repoName,
-      ref: pull.head.sha,
-      per_page: 100,
     }),
   ]);
 
   return {
     pull,
     reviews: reviewsResponse.data || [],
-    checkRuns: checkRunsResponse.data.check_runs || [],
-    combinedStatus: {
-      state: combinedStatusResponse.data.state || "none",
-      total_count:
-        combinedStatusResponse.data.total_count || combinedStatusResponse.data.statuses?.length || 0,
-    },
+    ...verification,
   };
 }
 
@@ -615,6 +611,12 @@ async function handleProductionStatus(req, res) {
     const { owner, repo: repoName } = parseRepo(repo);
     const octokit = await getOctokitForRepo(owner, repoName);
 
+    const verificationClient = createVerificationClient({
+      primaryClient: octokit,
+      authMode: AUTH_MODE,
+      verificationToken: GH_TOKEN,
+    });
+
     const packet = await buildProductionStatusPacket({
       repo,
       prNumber,
@@ -637,7 +639,7 @@ async function handleProductionStatus(req, res) {
         return response.data;
       },
       getCheckRuns: async (ref) => {
-        const response = await octokit.checks.listForRef({
+        const response = await verificationClient.checks.listForRef({
           owner,
           repo: repoName,
           ref,
@@ -646,7 +648,7 @@ async function handleProductionStatus(req, res) {
         return response.data.check_runs || [];
       },
       getCombinedStatus: async (ref) => {
-        const response = await octokit.repos.getCombinedStatusForRef({
+        const response = await verificationClient.repos.getCombinedStatusForRef({
           owner,
           repo: repoName,
           ref,
